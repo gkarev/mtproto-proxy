@@ -35,7 +35,18 @@ def save_config(data):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 def generate_secret():
-    """Генерация нового секрета"""
+    """Генерация нового секрета (правильный формат для MTG)"""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["/mtg/mtg", "generate-secret", "t.me"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except:
+        pass
+    # Fallback
     return secrets.token_hex(16)
 
 def get_running_containers():
@@ -58,12 +69,16 @@ def start_proxy_container(proxy_id, port, secret):
     subprocess.run(["docker", "stop", container_name], capture_output=True)
     subprocess.run(["docker", "rm", container_name], capture_output=True)
     
+    # Get config directory path
+    config_path = os.environ.get("CONFIG_PATH", "/app/config/proxies.json")
+    config_dir = config_path.replace("/proxies.json", "")
+    
     # Run new container
     cmd = [
         "docker", "run", "-d",
         "--name", container_name,
         "-p", f"{port}:8443",
-        "-v", f"{os.environ.get('CONFIG_PATH', '/app/config/proxies.json').replace('proxies.json', '')}:/app/config:ro",
+        "-v", f"{config_dir}:/app/config:ro",
         "-e", f"PROXY_ID={proxy_id}",
         MTG_IMAGE
     ]

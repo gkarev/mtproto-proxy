@@ -4,7 +4,9 @@
 # Читает конфигурацию из /app/config/proxies.json
 
 CONFIG_FILE="/app/config/proxies.json"
-PROXY_ID="${1:-default}"
+
+# PROXY_ID передаётся через переменную окружения или аргумент
+PROXY_ID="${PROXY_ID:-${1:-default}}"
 
 echo "MTG Proxy starting for: $PROXY_ID"
 
@@ -24,21 +26,15 @@ with open('$CONFIG_FILE') as f:
     print(proxy.get('secret', ''))
 ")
 
-PORT=$(python3 -c "
-import json
-with open('$CONFIG_FILE') as f:
-    data = json.load(f)
-    proxies = data.get('proxies', {})
-    proxy = proxies.get('$PROXY_ID', {})
-    print(proxy.get('port', '8443'))
-")
+# Port inside container is always 8443 (external port is mapped via docker)
+PORT_INTERNAL="8443"
 
 if [ -z "$SECRET" ]; then
     echo "Error: Proxy '$PROXY_ID' not found in config"
     exit 1
 fi
 
-echo "Starting MTG with port: $PORT, secret: $SECRET"
+echo "Starting MTG with port: $PORT_INTERNAL, secret: $SECRET"
 
 # Запускаем MTG
-exec mtg simple-run "0.0.0.0:$PORT" "$SECRET" --prefer-ip prefer-ipv4
+exec mtg simple-run "0.0.0.0:$PORT_INTERNAL" "$SECRET" --prefer-ip prefer-ipv4
