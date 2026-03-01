@@ -457,17 +457,31 @@ async def proxy_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Auto-start container
     success, msg = start_proxy_container(proxy_id, port, secret)
     
+    # Generate connection link
+    http_link = f"https://t.me/proxy?server={SERVER_IP}&port={port}&secret={secret}"
+    
     if success:
-        await update.message.reply_text(
-            f"✅ Прокси создан и запущен!\n\n"
-            f"ID: <code>{proxy_id}</code>\n"
-            f"Порт: <code>{port}</code>\n"
-            f"Секрет: <code>{secret}</code>",
-            parse_mode="HTML"
-        )
+        text = f"""✅ <b>Прокси создан и запущен!</b>
+
+<b>Настройки:</b>
+• ID: <code>{proxy_id}</code>
+• Сервер: <code>{SERVER_IP}</code>
+• Порт: <code>{port}</code>
+
+<b>Подключение:</b>
+
+<a href="{http_link}">👆 Нажмите для быстрого подключения</a>
+
+или вручную:
+• Настройки → Настройки прокси → Добавить
+• Тип: MTProto
+• Сервер: <code>{SERVER_IP}</code>
+• Порт: <code>{port}</code>"""
+        
+        await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
     else:
         await update.message.reply_text(
-            f"✅ Прокси создан, но не запущен!\n\n"
+            f"⚠️ Прокси создан, но не запущен!\n\n"
             f"ID: <code>{proxy_id}</code>\n"
             f"Порт: <code>{port}</code>\n"
             f"Секрет: <code>{secret}</code>\n\n"
