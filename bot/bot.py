@@ -209,12 +209,25 @@ async def proxy_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Get port from command
     if not context.args:
-        await update.message.reply_text("Использование: /proxy add <порт>\nПример: /proxy add 8443")
+        await update.message.reply_text(
+            "Использование: /proxy add <порт>\n"
+            "Пример: /proxy add 8443"
+        )
         return
     
+    # Handle /proxy add <port> or /proxy <port>
+    port_arg = context.args[0]
+    
+    # If first arg is "add", use second arg
+    if port_arg == "add":
+        if len(context.args) < 2:
+            await update.message.reply_text("Укажите порт: /proxy add 8443")
+            return
+        port_arg = context.args[1]
+    
     try:
-        port = int(context.args[0])
-    except:
+        port = int(port_arg)
+    except ValueError:
         await update.message.reply_text("Порт должен быть числом")
         return
     
