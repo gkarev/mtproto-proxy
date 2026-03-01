@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  mtg:
+    build: ./mtg
+    image: mtproto-mtg:latest
+    container_name: mtproto-default
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./config:/app/config:ro
+    restart: unless-stopped
+    environment:
+      - PROXY_ID=default
+    networks:
+      - mtproxy-net
+
+  bot:
+    build: ./bot
+    image: mtproto-bot:latest
+    container_name: mtproto-bot
+    volumes:
+      - ./config:/app/config
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    environment:
+      - SERVER_IP=${SERVER_IP}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - ALLOWED_USER_ID=${ALLOWED_USER_ID}
+    networks:
+      - mtproxy-net
+
+networks:
+  mtproxy-net:
+    driver: bridge
