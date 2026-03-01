@@ -37,15 +37,18 @@ def save_config(data):
 def generate_secret():
     """Генерация нового секрета (правильный формат для MTG)"""
     import subprocess
+    MTG_BINARY = "/root/.openclaw/workspace/mtproto-proxy/mtg/mtg"
+    
     try:
         result = subprocess.run(
-            ["/mtg/mtg", "generate-secret", "t.me"],
+            [MTG_BINARY, "generate-secret", "t.me"],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
     except:
         pass
+    
     # Fallback
     return secrets.token_hex(16)
 
