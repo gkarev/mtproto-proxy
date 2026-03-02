@@ -1,20 +1,6 @@
 version: '3.8'
 
 services:
-  mtg:
-    build: ./mtg
-    image: mtproto-mtg:latest
-    container_name: mtproto-default
-    ports:
-      - "8443:8443"
-    volumes:
-      - ./config:/app/config:ro
-    restart: unless-stopped
-    environment:
-      - PROXY_ID=default
-    networks:
-      - mtproxy-net
-
   bot:
     build: ./bot
     image: mtproto-bot:latest
@@ -27,8 +13,25 @@ services:
       - SERVER_IP=${SERVER_IP}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - ALLOWED_USER_ID=${ALLOWED_USER_ID}
+      - CONFIG_PATH=/app/config/proxies.json
+      - MTG_IMAGE=mtproto-mtg:latest
+      - MTG_BINARY=/usr/local/bin/mtg
     networks:
       - mtproxy-net
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os; exit(0 if os.environ.get('TELEGRAM_BOT_TOKEN') else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Образ MTG — собирается один раз, далее используется ботом динамически
+  mtg-builder:
+    build: ./mtg
+    image: mtproto-mtg:latest
+    # Не запускаем напрямую: контейнеры создаются ботом через Docker API
+    profiles:
+      - build-only
 
 networks:
   mtproxy-net:

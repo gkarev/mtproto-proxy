@@ -5,582 +5,680 @@ MTProto Proxy Telegram Bot
 """
 import os
 import json
+import logging
 import subprocess
 import secrets
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
-# Конфигурация из переменных окружения
-SERVER_IP = os.environ.get("SERVER_IP", "127.0.0.1")
+# ─── Логирование ────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("mtproto-bot")
+
+# ─── Конфигурация ────────────────────────────────────────────────────────────
+SERVER_IP = os.environ.get("SERVER_IP", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0"))
 
-# Путь к конфигу
-CONFIG_PATH = "/app/config/proxies.json"
-MTG_IMAGE = "mtproto-mtg:latest"
+CONFIG_PATH = os.environ.get("CONFIG_PATH", "/app/config/proxies.json")
+MTG_IMAGE = os.environ.get("MTG_IMAGE", "mtproto-mtg:latest")
+MTG_BINARY = os.environ.get("MTG_BINARY", "/usr/local/bin/mtg")
 
-def load_config():
-    """Загрузка конфигурации"""
-    path = os.environ.get("CONFIG_PATH", CONFIG_PATH)
+PORT_MIN = 1024
+PORT_MAX = 65535
+
+
+# ─── Конфиг ─────────────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    """Загрузка конфигурации из JSON-файла."""
     try:
-        with open(path, 'r') as f:
-            return json.load(f)
-    except:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if "proxies" not in data:
+                data["proxies"] = {}
+            return data
+    except FileNotFoundError:
+        logger.warning("Файл конфига не найден: %s — создаю пустой", CONFIG_PATH)
+        return {"proxies": {}}
+    except json.JSONDecodeError as e:
+        logger.error("Ошибка разбора JSON в конфиге: %s", e)
+        return {"proxies": {}}
+    except OSError as e:
+        logger.error("Ошибка чтения конфига: %s", e)
         return {"proxies": {}}
 
-def save_config(data):
-    """Сохранение конфигурации"""
-    path = os.environ.get("CONFIG_PATH", CONFIG_PATH)
-    with open(path, 'w') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
 
-def generate_secret():
-    """Генерация нового секрета (правильный формат для MTG)"""
-    import subprocess
-    MTG_BINARY = "/root/.openclaw/workspace/mtproto-proxy/mtg/mtg"
-    
+def save_config(data: dict) -> bool:
+    """Сохранение конфигурации. Возвращает True при успехе."""
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        logger.info("Конфиг сохранён: %s", CONFIG_PATH)
+        return True
+    except OSError as e:
+        logger.error("Ошибка записи конфига: %s", e)
+        return False
+
+
+# ─── Вспомогательные функции ─────────────────────────────────────────────────
+
+def generate_secret() -> str:
+    """Генерация MTProto-секрета через бинарник mtg, fallback — hex."""
     try:
         result = subprocess.run(
             [MTG_BINARY, "generate-secret", "t.me"],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except:
-        pass
-    
-    # Fallback
-    return secrets.token_hex(16)
+            secret = result.stdout.strip()
+            logger.info("Секрет сгенерирован через mtg binary")
+            return secret
+        logger.warning("mtg binary вернул код %d: %s", result.returncode, result.stderr.strip())
+    except FileNotFoundError:
+        logger.warning("MTG binary не найден по пути: %s", MTG_BINARY)
+    except subprocess.TimeoutExpired:
+        logger.warning("Таймаут при генерации секрета через mtg")
+    except OSError as e:
+        logger.warning("Ошибка запуска mtg: %s", e)
 
-def get_running_containers():
-    """Получить список работающих контейнеров"""
+    # Fallback: стандартный hex-секрет (32 байта = 64 символа)
+    fallback = secrets.token_hex(32)
+    logger.info("Использован fallback для генерации секрета")
+    return fallback
+
+
+def is_port_valid(port: int) -> tuple[bool, str]:
+    """Проверка допустимости порта."""
+    if not (PORT_MIN <= port <= PORT_MAX):
+        return False, f"Порт должен быть от {PORT_MIN} до {PORT_MAX}"
+    return True, ""
+
+
+def is_port_in_use(port: int) -> bool:
+    """Проверка — занят ли порт уже каким-то контейнером."""
     result = subprocess.run(
-        ["docker", "ps", "--filter", "name=mtproto-", "--format", "{{.Names}}"],
+        ["docker", "ps", "--format", "{{.Ports}}"],
         capture_output=True, text=True
     )
-    return [c for c in result.stdout.strip().split("\n") if c]
+    return f":{port}->" in result.stdout or f"0.0.0.0:{port}" in result.stdout
 
-def start_proxy_container(proxy_id, port, secret):
-    """Запустить контейнер прокси"""
+
+def get_running_containers() -> list[str]:
+    """Список работающих контейнеров с префиксом mtproto-."""
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "--filter", "name=mtproto-", "--format", "{{.Names}}"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            logger.error("docker ps вернул ошибку: %s", result.stderr.strip())
+            return []
+        return [c for c in result.stdout.strip().split("\n") if c]
+    except subprocess.TimeoutExpired:
+        logger.error("Таймаут при запросе docker ps")
+        return []
+    except OSError as e:
+        logger.error("Ошибка при вызове docker: %s", e)
+        return []
+
+
+def start_proxy_container(proxy_id: str, port: int | str, secret: str) -> tuple[bool, str]:
+    """Запустить Docker-контейнер для прокси."""
     container_name = f"mtproto-{proxy_id}"
-    
-    # Check if already running
-    if container_name in get_running_containers():
-        return False, "Уже запущен"
-    
-    # Stop old container if exists
+
+    # Останавливаем старый (если есть) — идемпотентно
     subprocess.run(["docker", "stop", container_name], capture_output=True)
     subprocess.run(["docker", "rm", container_name], capture_output=True)
-    
-    # Get config directory path
-    config_path = os.environ.get("CONFIG_PATH", "/app/config/proxies.json")
-    config_dir = config_path.replace("/proxies.json", "")
-    
-    # Run new container
+
+    config_dir = os.path.dirname(CONFIG_PATH)
+
     cmd = [
         "docker", "run", "-d",
         "--name", container_name,
         "-p", f"{port}:8443",
         "-v", f"{config_dir}:/app/config:ro",
         "-e", f"PROXY_ID={proxy_id}",
-        MTG_IMAGE
+        "--restart", "unless-stopped",
+        MTG_IMAGE,
     ]
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        logger.error("Таймаут при запуске контейнера %s", container_name)
+        return False, "Таймаут при запуске"
+    except OSError as e:
+        logger.error("Ошибка запуска контейнера %s: %s", container_name, e)
+        return False, str(e)
+
     if result.returncode != 0:
-        return False, f"Ошибка: {result.stderr}"
-    
+        err = result.stderr.strip()
+        logger.error("docker run завершился с кодом %d: %s", result.returncode, err)
+        return False, err or "Неизвестная ошибка Docker"
+
+    logger.info("Контейнер %s запущен на порту %s", container_name, port)
     return True, "Запущен"
 
-def stop_proxy_container(proxy_id):
-    """Остановить контейнер прокси"""
+
+def stop_proxy_container(proxy_id: str) -> tuple[bool, str]:
+    """Остановить контейнер прокси."""
     container_name = f"mtproto-{proxy_id}"
-    result = subprocess.run(["docker", "stop", container_name], capture_output=True, text=True)
-    
+    try:
+        result = subprocess.run(
+            ["docker", "stop", container_name],
+            capture_output=True, text=True, timeout=15
+        )
+    except subprocess.TimeoutExpired:
+        return False, "Таймаут при остановке"
+    except OSError as e:
+        return False, str(e)
+
     if result.returncode != 0:
+        logger.warning("Не удалось остановить %s: %s", container_name, result.stderr.strip())
         return False, "Контейнер не найден или уже остановлен"
-    
+
+    logger.info("Контейнер %s остановлен", container_name)
     return True, "Остановлен"
 
-def restart_proxy_container(proxy_id):
-    """Перезапустить контейнер прокси"""
+
+def restart_proxy_container(proxy_id: str) -> tuple[bool, str]:
+    """Перезапустить контейнер прокси."""
     container_name = f"mtproto-{proxy_id}"
-    result = subprocess.run(["docker", "restart", container_name], capture_output=True, text=True)
-    
+    try:
+        result = subprocess.run(
+            ["docker", "restart", container_name],
+            capture_output=True, text=True, timeout=30
+        )
+    except subprocess.TimeoutExpired:
+        return False, "Таймаут при перезапуске"
+    except OSError as e:
+        return False, str(e)
+
     if result.returncode != 0:
+        logger.warning("Не удалось перезапустить %s: %s", container_name, result.stderr.strip())
         return False, "Контейнер не найден"
-    
+
+    logger.info("Контейнер %s перезапущен", container_name)
     return True, "Перезапущен"
 
-def check_user(update: Update) -> bool:
-    """Проверка разрешённого пользователя"""
-    return update.effective_user.id == ALLOWED_USER_ID
 
-def get_main_menu_keyboard():
-    """Главное меню"""
+# ─── Авторизация ─────────────────────────────────────────────────────────────
+
+def check_user(update: Update) -> bool:
+    """Проверка — является ли пользователь разрешённым."""
+    user = update.effective_user
+    if user is None:
+        return False
+    allowed = user.id == ALLOWED_USER_ID
+    if not allowed:
+        logger.warning("Отказано в доступе пользователю id=%d", user.id)
+    return allowed
+
+
+# ─── UI-хелперы ──────────────────────────────────────────────────────────────
+
+def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📋 Список прокси", callback_data="proxy_list")],
         [InlineKeyboardButton("➕ Добавить прокси", callback_data="proxy_add")],
         [InlineKeyboardButton("🔧 Управление", callback_data="proxy_manage")],
-        [InlineKeyboardButton("ℹ️ Статус", callback_data="proxy_status")]
+        [InlineKeyboardButton("ℹ️ Статус", callback_data="proxy_status")],
     ])
 
+
+def build_proxy_row(name: str, is_running: bool) -> list[list[InlineKeyboardButton]]:
+    """Строит строки кнопок для одного прокси в списке."""
+    status_icon = "✅" if is_running else "❌"
+    rows = [
+        [InlineKeyboardButton(
+            f"🔗 {status_icon} {name} — подключиться",
+            callback_data=f"proxy_connect_{name}"
+        )],
+        [
+            InlineKeyboardButton("▶️ Старт", callback_data=f"proxy_start_{name}"),
+            InlineKeyboardButton("⏹ Стоп", callback_data=f"proxy_stop_{name}"),
+            InlineKeyboardButton("🔄 Рестарт", callback_data=f"proxy_restart_{name}"),
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"proxy_delete_confirm_{name}"),
+        ],
+    ]
+    return rows
+
+
+def build_status_text(proxies: dict, running: list[str]) -> str:
+    """Строит текст статуса для всех прокси."""
+    if not proxies:
+        return "📭 Нет прокси\n\nИспользуйте <code>/proxy add &lt;порт&gt;</code> для добавления."
+    lines = ["ℹ️ <b>Статус системы:</b>\n"]
+    for name, data in proxies.items():
+        port = data.get("port", "?")
+        container_name = f"mtproto-{name}"
+        icon = "✅" if container_name in running else "❌"
+        lines.append(f"{icon} <b>{name}</b> — порт <code>{port}</code>")
+    return "\n".join(lines)
+
+
+# ─── Обработчики команд ──────────────────────────────────────────────────────
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Главное меню"""
+    """Команда /start — главное меню."""
     if not check_user(update):
         await update.message.reply_text("⛔ Доступ запрещён")
         return
-    
     await update.message.reply_text(
-        "🔐 <b>MTProto Proxy Manager</b>\n\n"
-        "Выберите действие:",
+        "🔐 <b>MTProto Proxy Manager</b>\n\nВыберите действие:",
         reply_markup=get_main_menu_keyboard(),
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /help — справка."""
+    if not check_user(update):
+        await update.message.reply_text("⛔ Доступ запрещён")
+        return
+    text = (
+        "📖 <b>Команды:</b>\n\n"
+        "/start — Главное меню\n"
+        "/proxy add &lt;порт&gt; — Добавить и запустить прокси\n"
+        "/help — Эта справка\n\n"
+        "<b>Пример:</b> <code>/proxy add 8443</code>\n\n"
+        f"<b>Допустимый диапазон портов:</b> {PORT_MIN}–{PORT_MAX}"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def proxy_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /proxy add <порт> — добавить прокси."""
+    if not check_user(update):
+        await update.message.reply_text("⛔ Доступ запрещён")
+        return
+
+    args = context.args or []
+
+    # Разбор: /proxy add 8443  или  /proxy 8443
+    if args and args[0] == "add":
+        args = args[1:]
+
+    if not args:
+        await update.message.reply_text(
+            "Использование: <code>/proxy add &lt;порт&gt;</code>\n"
+            f"Пример: <code>/proxy add 8443</code>\n"
+            f"Допустимый диапазон: {PORT_MIN}–{PORT_MAX}",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        port = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Порт должен быть числом.")
+        return
+
+    # Валидация диапазона
+    valid, err = is_port_valid(port)
+    if not valid:
+        await update.message.reply_text(f"❌ {err}")
+        return
+
+    # Проверка занятости порта
+    if is_port_in_use(port):
+        await update.message.reply_text(
+            f"❌ Порт <code>{port}</code> уже занят другим контейнером.",
+            parse_mode="HTML",
+        )
+        return
+
+    proxy_id = f"proxy{port}"
+    config = load_config()
+
+    if proxy_id in config.get("proxies", {}):
+        await update.message.reply_text(f"⚠️ Прокси <code>{proxy_id}</code> уже существует!", parse_mode="HTML")
+        return
+
+    secret = generate_secret()
+    config["proxies"][proxy_id] = {
+        "secret": secret,
+        "port": str(port),
+        "status": "active",
+        "owner": "admin",
+    }
+
+    if not save_config(config):
+        await update.message.reply_text("❌ Не удалось сохранить конфиг. Проверьте права доступа.")
+        return
+
+    # Автозапуск
+    success, msg_run = start_proxy_container(proxy_id, port, secret)
+    http_link = f"https://t.me/proxy?server={SERVER_IP}&port={port}&secret={secret}"
+
+    if success:
+        text = (
+            f"✅ <b>Прокси создан и запущен!</b>\n\n"
+            f"• ID: <code>{proxy_id}</code>\n"
+            f"• Сервер: <code>{SERVER_IP}</code>\n"
+            f"• Порт: <code>{port}</code>\n\n"
+            f'<a href="{http_link}">👆 Быстрое подключение</a>\n\n'
+            f"<i>или вручную: Настройки → Прокси → Добавить → MTProto</i>"
+        )
+    else:
+        text = (
+            f"⚠️ <b>Прокси создан, но не запущен</b>\n\n"
+            f"• ID: <code>{proxy_id}</code>\n"
+            f"• Порт: <code>{port}</code>\n\n"
+            f"Ошибка: <code>{msg_run}</code>\n\n"
+            f"Запустите вручную через меню управления."
+        )
+
+    await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
+    logger.info("Прокси %s создан пользователем %d", proxy_id, update.effective_user.id)
+
+
+# ─── Обработчик кнопок ───────────────────────────────────────────────────────
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка кнопок"""
+    """Единый диспетчер callback-кнопок."""
     query = update.callback_query
     await query.answer()
-    
+
     if not check_user(update):
         await query.edit_message_text("⛔ Доступ запрещён")
         return
-    
-    # Navigation
-    if query.data == "main_menu":
-        await show_main_menu(query)
-    elif query.data == "proxy_list":
-        await show_proxy_list(query)
-    elif query.data == "proxy_add":
-        await show_proxy_add(query)
-    elif query.data == "proxy_status":
-        await show_proxy_status(query)
-    elif query.data == "proxy_manage":
-        await show_proxy_manage(query)
-    # Connect
-    elif query.data.startswith("proxy_connect_"):
-        proxy_id = query.data.replace("proxy_connect_", "")
-        await show_proxy_connect(query, proxy_id)
-    # Delete
-    elif query.data.startswith("proxy_delete_"):
-        proxy_id = query.data.replace("proxy_delete_", "")
-        await delete_proxy(query, proxy_id)
-    # Start
-    elif query.data.startswith("proxy_start_"):
-        proxy_id = query.data.replace("proxy_start_", "")
-        await start_proxy(query, proxy_id)
-    # Stop
-    elif query.data.startswith("proxy_stop_"):
-        proxy_id = query.data.replace("proxy_stop_", "")
-        await stop_proxy(query, proxy_id)
-    # Restart
-    elif query.data.startswith("proxy_restart_"):
-        proxy_id = query.data.replace("proxy_restart_", "")
-        await restart_proxy(query, proxy_id)
+
+    data = query.data
+
+    routes = {
+        "main_menu":    lambda: show_main_menu(query),
+        "proxy_list":   lambda: show_proxy_list(query),
+        "proxy_add":    lambda: show_proxy_add(query),
+        "proxy_status": lambda: show_proxy_status(query),
+        "proxy_manage": lambda: show_proxy_manage(query),
+    }
+
+    if data in routes:
+        await routes[data]()
+    elif data.startswith("proxy_connect_"):
+        await show_proxy_connect(query, data.removeprefix("proxy_connect_"))
+    elif data.startswith("proxy_start_"):
+        await action_start_proxy(query, data.removeprefix("proxy_start_"))
+    elif data.startswith("proxy_stop_"):
+        await action_stop_proxy(query, data.removeprefix("proxy_stop_"))
+    elif data.startswith("proxy_restart_"):
+        await action_restart_proxy(query, data.removeprefix("proxy_restart_"))
+    elif data.startswith("proxy_delete_confirm_"):
+        await show_delete_confirm(query, data.removeprefix("proxy_delete_confirm_"))
+    elif data.startswith("proxy_delete_do_"):
+        await action_delete_proxy(query, data.removeprefix("proxy_delete_do_"))
+    else:
+        logger.warning("Неизвестный callback: %s", data)
+
+
+# ─── Экраны ──────────────────────────────────────────────────────────────────
 
 async def show_main_menu(query):
-    """Показать главное меню"""
     await query.edit_message_text(
-        "🔐 <b>MTProto Proxy Manager</b>\n\n"
-        "Выберите действие:",
+        "🔐 <b>MTProto Proxy Manager</b>\n\nВыберите действие:",
         reply_markup=get_main_menu_keyboard(),
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
+
 async def show_proxy_list(query):
-    """Показать список прокси"""
+    """Список прокси с кнопками управления."""
     config = load_config()
     proxies = config.get("proxies", {})
     running = get_running_containers()
-    
+
     if not proxies:
         await query.edit_message_text(
             "📭 Нет прокси. Добавьте первый!",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ Добавить прокси", callback_data="proxy_add")],
-                [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]
-            ])
+                [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")],
+            ]),
         )
         return
-    
-    msg = "📋 <b>Список прокси:</b>\n\n"
+
+    msg_lines = ["📋 <b>Список прокси:</b>\n"]
     keyboard = []
-    
+
     for name, data in proxies.items():
+        port = data.get("port", "?")
         container_name = f"mtproto-{name}"
-        status = "✅" if container_name in running else "❌"
-        msg += f"• <b>{name}</b> {status}\n"
-        msg += f"  Порт: {data.get('port')}\n\n"
-        
-        keyboard.append([InlineKeyboardButton(f"🔗 Подключиться: {name}", callback_data=f"proxy_connect_{name}")])
-        keyboard.append([
-            InlineKeyboardButton("▶️", callback_data=f"proxy_start_{name}"),
-            InlineKeyboardButton("⏹️", callback_data=f"proxy_stop_{name}"),
-            InlineKeyboardButton("🔄", callback_data=f"proxy_restart_{name}"),
-            InlineKeyboardButton("🗑️", callback_data=f"proxy_delete_{name}")
-        ])
-    
+        is_running = container_name in running
+        status_icon = "✅" if is_running else "❌"
+
+        msg_lines.append(f"{status_icon} <b>{name}</b> — порт <code>{port}</code>")
+        keyboard.extend(build_proxy_row(name, is_running))
+
     keyboard.append([InlineKeyboardButton("➕ Добавить прокси", callback_data="proxy_add")])
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="main_menu")])
-    
-    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+
+    await query.edit_message_text(
+        "\n".join(msg_lines),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
+    )
+
 
 async def show_proxy_add(query):
-    """Показать форму добавления"""
+    """Инструкция по добавлению прокси."""
     await query.edit_message_text(
         "➕ <b>Добавить прокси</b>\n\n"
-        "Используйте команду:\n"
+        "Отправьте команду в чат:\n"
         "<code>/proxy add 8443</code>\n\n"
-        "Где 8443 - порт прокси\n\n"
-        "После добавления прокси будет <b>автоматически запущен</b>!",
+        f"Где <code>8443</code> — порт ({PORT_MIN}–{PORT_MAX})\n\n"
+        "После добавления прокси будет <b>автоматически запущен</b>.",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]
+            [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")],
         ]),
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
+
 
 async def show_proxy_status(query):
-    """Показать статус"""
+    """Статус всех прокси."""
     config = load_config()
     proxies = config.get("proxies", {})
     running = get_running_containers()
-    
-    msg = "ℹ️ <b>Статус системы:</b>\n\n"
-    
-    if not proxies:
-        msg = "📭 Нет прокси\n\n"
-    
-    for name, data in proxies.items():
-        port = data.get("port", "")
-        container_name = f"mtproto-{name}"
-        
-        if container_name in running:
-            msg += f"✅ <b>{name}</b> (порт {port}) - работает\n"
-        else:
-            msg += f"❌ <b>{name}</b> (порт {port}) - остановлен\n"
-    
+
     await query.edit_message_text(
-        msg,
+        build_status_text(proxies, running),
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]
+            [InlineKeyboardButton("🔄 Обновить", callback_data="proxy_status")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")],
         ]),
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
+
 async def show_proxy_manage(query):
-    """Меню управления прокси"""
+    """Меню управления прокси."""
     config = load_config()
     proxies = config.get("proxies", {})
     running = get_running_containers()
-    
+
     if not proxies:
         await query.edit_message_text(
-            "📭 Нет прокси для управления",
+            "📭 Нет прокси для управления.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]
-            ])
+                [InlineKeyboardButton("➕ Добавить прокси", callback_data="proxy_add")],
+                [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")],
+            ]),
         )
         return
-    
-    msg = "🔧 <b>Управление прокси:</b>\n\n"
-    keyboard = []
-    
-    for name, data in proxies.items():
-        port = data.get("port", "")
-        container_name = f"mtproto-{name}"
-        status = "▶️ Запустить" if container_name not in running else "⏹️ Остановить"
-        
-        keyboard.append([
-            InlineKeyboardButton(f"▶️ {name}", callback_data=f"proxy_start_{name}"),
-            InlineKeyboardButton(f"⏹️ {name}", callback_data=f"proxy_stop_{name}")
-        ])
-        keyboard.append([
-            InlineKeyboardButton(f"🔄 Перезапустить {name}", callback_data=f"proxy_restart_{name}")
-        ])
-    
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="main_menu")])
-    
-    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
-async def show_proxy_connect(query, proxy_id):
-    """Показать данные для подключения"""
+    msg_lines = ["🔧 <b>Управление прокси:</b>\n"]
+    keyboard = []
+
+    for name, data in proxies.items():
+        port = data.get("port", "?")
+        container_name = f"mtproto-{name}"
+        is_running = container_name in running
+        status = "✅ работает" if is_running else "❌ остановлен"
+
+        msg_lines.append(f"• <b>{name}</b> (порт <code>{port}</code>) — {status}")
+        keyboard.extend(build_proxy_row(name, is_running))
+
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="main_menu")])
+
+    await query.edit_message_text(
+        "\n".join(msg_lines),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
+    )
+
+
+async def show_proxy_connect(query, proxy_id: str):
+    """Данные для подключения к прокси."""
     config = load_config()
-    proxies = config.get("proxies", {})
-    proxy = proxies.get(proxy_id, {})
-    
+    proxy = config.get("proxies", {}).get(proxy_id)
+
     if not proxy:
-        await query.edit_message_text("❌ Прокси не найден")
+        await query.edit_message_text(
+            "❌ Прокси не найден.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 К списку", callback_data="proxy_list")],
+            ]),
+        )
         return
-    
+
     secret = proxy.get("secret", "")
     port = proxy.get("port", "8443")
     http_link = f"https://t.me/proxy?server={SERVER_IP}&port={port}&secret={secret}"
-    
-    text = f"""🔗 <b>Прокси: {proxy_id}</b>
 
-<b>Настройки:</b>
-• Сервер: <code>{SERVER_IP}</code>
-• Порт: <code>{port}</code>
+    text = (
+        f"🔗 <b>Прокси: {proxy_id}</b>\n\n"
+        f"• Сервер: <code>{SERVER_IP}</code>\n"
+        f"• Порт: <code>{port}</code>\n\n"
+        f'<a href="{http_link}">👆 Быстрое подключение</a>\n\n'
+        f"<i>или вручную:\n"
+        f"Настройки → Прокси → Добавить\n"
+        f"Тип: MTProto\n"
+        f"Сервер: {SERVER_IP} Порт: {port}</i>"
+    )
 
-<b>Подключение:</b>
-
-<a href="{http_link}">👆 Нажмите для быстрого подключения</a>
-
-или вручную:
-• Настройки → Настройки прокси → Добавить
-• Тип: MTProto
-• Сервер: <code>{SERVER_IP}</code>
-• Порт: <code>{port}</code>"""
-    
     await query.edit_message_text(
         text,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 К списку", callback_data="proxy_list")]
+            [InlineKeyboardButton("🔙 К списку", callback_data="proxy_list")],
         ]),
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
-async def start_proxy(query, proxy_id):
-    """Запустить прокси"""
+
+async def show_delete_confirm(query, proxy_id: str):
+    """Экран подтверждения удаления прокси."""
+    await query.edit_message_text(
+        f"🗑 <b>Удалить прокси <code>{proxy_id}</code>?</b>\n\n"
+        "⚠️ Контейнер будет остановлен и удалён вместе с настройками.",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Да, удалить", callback_data=f"proxy_delete_do_{proxy_id}"),
+                InlineKeyboardButton("❌ Отмена", callback_data="proxy_list"),
+            ],
+        ]),
+        parse_mode="HTML",
+    )
+
+
+# ─── Действия над прокси ────────────────────────────────────────────────────
+
+async def action_start_proxy(query, proxy_id: str):
     config = load_config()
-    proxies = config.get("proxies", {})
-    
-    if proxy_id not in proxies:
+    proxy = config.get("proxies", {}).get(proxy_id)
+
+    if not proxy:
         await query.answer("❌ Прокси не найден", show_alert=True)
         return
-    
-    proxy = proxies[proxy_id]
+
     port = proxy.get("port", "8443")
     secret = proxy.get("secret", "")
-    
     success, msg = start_proxy_container(proxy_id, port, secret)
-    
+
     if success:
-        await query.answer(f"✅ {proxy_id} запущен!", show_alert=True)
+        await query.answer(f"✅ {proxy_id} запущен!", show_alert=False)
     else:
         await query.answer(f"⚠️ {msg}", show_alert=True)
-    
+
     await show_proxy_list(query)
 
-async def stop_proxy(query, proxy_id):
-    """Остановить прокси"""
+
+async def action_stop_proxy(query, proxy_id: str):
     success, msg = stop_proxy_container(proxy_id)
-    
+
     if success:
-        await query.answer(f"✅ {proxy_id} остановлен!", show_alert=True)
+        await query.answer(f"✅ {proxy_id} остановлен", show_alert=False)
     else:
         await query.answer(f"⚠️ {msg}", show_alert=True)
-    
+
     await show_proxy_list(query)
 
-async def restart_proxy(query, proxy_id):
-    """Перезапустить прокси"""
+
+async def action_restart_proxy(query, proxy_id: str):
     success, msg = restart_proxy_container(proxy_id)
-    
+
     if success:
-        await query.answer(f"✅ {proxy_id} перезапущен!", show_alert=True)
+        await query.answer(f"✅ {proxy_id} перезапущен", show_alert=False)
     else:
         await query.answer(f"⚠️ {msg}", show_alert=True)
-    
+
     await show_proxy_list(query)
 
-async def delete_proxy(query, proxy_id):
-    """Удалить прокси"""
+
+async def action_delete_proxy(query, proxy_id: str):
+    """Удаление прокси после подтверждения."""
     config = load_config()
     proxies = config.get("proxies", {})
-    
+
     if proxy_id not in proxies:
         await query.edit_message_text("❌ Прокси не найден")
         return
-    
-    # Stop and remove container
+
     container_name = f"mtproto-{proxy_id}"
     subprocess.run(["docker", "stop", container_name], capture_output=True)
     subprocess.run(["docker", "rm", container_name], capture_output=True)
-    
-    # Remove from config
+
     del proxies[proxy_id]
     config["proxies"] = proxies
-    save_config(config)
-    
-    await query.answer(f"✅ {proxy_id} удалён!", show_alert=True)
+
+    if not save_config(config):
+        await query.answer("❌ Ошибка сохранения конфига", show_alert=True)
+        return
+
+    logger.info("Прокси %s удалён", proxy_id)
+    await query.answer(f"✅ {proxy_id} удалён", show_alert=False)
     await show_proxy_list(query)
 
-async def proxy_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Добавить прокси"""
-    if not check_user(update):
-        await update.message.reply_text("⛔ Доступ запрещён")
-        return
-    
-    # Get port from command
-    if not context.args:
-        await update.message.reply_text(
-            "Использование: /proxy add <порт>\n"
-            "Пример: /proxy add 8443"
-        )
-        return
-    
-    # Handle /proxy add <port> or /proxy <port>
-    port_arg = context.args[0]
-    
-    # If first arg is "add", use second arg
-    if port_arg == "add":
-        if len(context.args) < 2:
-            await update.message.reply_text("Укажите порт: /proxy add 8443")
-            return
-        port_arg = context.args[1]
-    
-    try:
-        port = int(port_arg)
-    except ValueError:
-        await update.message.reply_text("Порт должен быть числом")
-        return
-    
-    # Generate secret
-    proxy_id = f"proxy{port}"
-    secret = generate_secret()
-    
-    # Add to config
-    config = load_config()
-    
-    if proxy_id in config.get("proxies", {}):
-        await update.message.reply_text(f"⚠️ Прокси {proxy_id} уже существует!")
-        return
-    
-    config["proxies"][proxy_id] = {
-        "secret": secret,
-        "port": str(port),
-        "status": "active",
-        "owner": "admin"
-    }
-    save_config(config)
-    
-    # Auto-start container
-    success, msg = start_proxy_container(proxy_id, port, secret)
-    
-    # Generate connection link
-    http_link = f"https://t.me/proxy?server={SERVER_IP}&port={port}&secret={secret}"
-    
-    if success:
-        text = f"""✅ <b>Прокси создан и запущен!</b>
 
-<b>Настройки:</b>
-• ID: <code>{proxy_id}</code>
-• Сервер: <code>{SERVER_IP}</code>
-• Порт: <code>{port}</code>
-
-<b>Подключение:</b>
-
-<a href="{http_link}">👆 Нажмите для быстрого подключения</a>
-
-или вручную:
-• Настройки → Настройки прокси → Добавить
-• Тип: MTProto
-• Сервер: <code>{SERVER_IP}</code>
-• Порт: <code>{port}</code>"""
-        
-        await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
-    else:
-        await update.message.reply_text(
-            f"⚠️ Прокси создан, но не запущен!\n\n"
-            f"ID: <code>{proxy_id}</code>\n"
-            f"Порт: <code>{port}</code>\n"
-            f"Секрет: <code>{secret}</code>\n\n"
-            f"Ошибка: {msg}",
-            parse_mode="HTML"
-        )
-
-async def proxy_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Список прокси"""
-    if not check_user(update):
-        await update.message.reply_text("⛔ Доступ запрещён")
-        return
-    
-    config = load_config()
-    proxies = config.get("proxies", {})
-    running = get_running_containers()
-    
-    if not proxies:
-        await update.message.reply_text("📭 Нет прокси")
-        return
-    
-    msg = "📋 <b>Список прокси:</b>\n\n"
-    for name, data in proxies.items():
-        container_name = f"mtproto-{name}"
-        status = "✅" if container_name in running else "❌"
-        msg += f"• <b>{name}</b> {status}\n"
-        msg += f"  Порт: {data.get('port')}\n\n"
-    
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-async def proxy_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Статус прокси"""
-    if not check_user(update):
-        await update.message.reply_text("⛔ Доступ запрещён")
-        return
-    
-    await show_proxy_status_command(update)
-
-async def show_proxy_status_command(update):
-    """Показать статус (для команды)"""
-    config = load_config()
-    proxies = config.get("proxies", {})
-    running = get_running_containers()
-    
-    msg = "ℹ️ <b>Статус:</b>\n\n"
-    for name, data in proxies.items():
-        container_name = f"mtproto-{name}"
-        if container_name in running:
-            msg += f"✅ <b>{name}</b> - работает\n"
-        else:
-            msg += f"❌ <b>{name}</b> - остановлен\n"
-    
-    if update.message:
-        await update.message.reply_text(msg, parse_mode="HTML")
-    else:
-        return msg
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Справка"""
-    if not check_user(update):
-        await update.message.reply_text("⛔ Доступ запрещён")
-        return
-    
-    text = """📖 <b>Команды:</b>
-
-/start - Главное меню
-/proxy add <порт> - Добавить прокси (автозапуск!)
-/proxy list - Список прокси
-/proxy status - Статус
-/help - Эта справка
-
-Пример: /proxy add 8443"""
-    
-    await update.message.reply_text(text, parse_mode="HTML")
+# ─── Точка входа ─────────────────────────────────────────────────────────────
 
 def main():
-    """Запуск бота"""
     if not TELEGRAM_TOKEN:
-        print("Error: TELEGRAM_BOT_TOKEN not set")
-        return
-    
+        logger.critical("TELEGRAM_BOT_TOKEN не задан — выход")
+        raise SystemExit(1)
+
     if not ALLOWED_USER_ID:
-        print("Error: ALLOWED_USER_ID not set")
-        return
-    
+        logger.critical("ALLOWED_USER_ID не задан — выход")
+        raise SystemExit(1)
+
+    if not SERVER_IP:
+        logger.warning("SERVER_IP не задан — ссылки на подключение будут некорректны")
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("proxy", proxy_add))
-    app.add_handler(CommandHandler("proxy_list", proxy_list))
-    app.add_handler(CommandHandler("proxy_status", proxy_status))
     app.add_handler(CallbackQueryHandler(button_handler))
-    
-    print("MTProto Proxy Bot started...")
+
+    logger.info("MTProto Proxy Bot запущен (allowed user: %d)", ALLOWED_USER_ID)
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
