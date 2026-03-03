@@ -691,6 +691,18 @@ async def action_delete_proxy(query, proxy_id: str):
 
 # ─── Точка входа ─────────────────────────────────────────────────────────────
 
+async def post_init(application) -> None:
+    """Устанавливает список команд бота в Telegram после старта."""
+    from telegram import BotCommand
+    commands = [
+        BotCommand("start", "Главное меню"),
+        BotCommand("proxy", "Добавить прокси: /proxy add <порт>"),
+        BotCommand("help", "Справка по командам"),
+    ]
+    await application.bot.set_my_commands(commands)
+    logger.info("Команды бота установлены в Telegram")
+
+
 def main():
     if not TELEGRAM_TOKEN:
         logger.critical("TELEGRAM_BOT_TOKEN не задан — выход")
@@ -703,7 +715,12 @@ def main():
     if not SERVER_IP:
         logger.warning("SERVER_IP не задан — ссылки на подключение будут некорректны")
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
