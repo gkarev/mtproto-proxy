@@ -283,9 +283,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = (
         "📖 <b>Команды:</b>\n\n"
-        "/start — Главное меню\n"
-        "/proxy add &lt;порт&gt; — Добавить и запустить прокси\n"
-        "/help — Эта справка\n\n"
+        "<code>/start</code> — Главное меню\n"
+        "<code>/proxy add &lt;порт&gt;</code> — Добавить и запустить прокси\n"
+        "<code>/help</code> — Эта справка\n\n"
         "<b>Пример:</b> <code>/proxy add 8443</code>\n\n"
         f"<b>Допустимый диапазон портов:</b> {PORT_MIN}–{PORT_MAX}"
     )
@@ -469,9 +469,9 @@ async def show_proxy_add(query):
     """Инструкция по добавлению прокси."""
     await query.edit_message_text(
         "➕ <b>Добавить прокси</b>\n\n"
-        "Отправьте команду в чат:\n"
+        "Отправьте команду в чат:\n\n"
         "<code>/proxy add 8443</code>\n\n"
-        f"Где <code>8443</code> — порт ({PORT_MIN}–{PORT_MAX})\n\n"
+        f"Где <code>8443</code> — любой свободный порт ({PORT_MIN}–{PORT_MAX}).\n\n"
         "После добавления прокси будет <b>автоматически запущен</b>.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")],
@@ -636,7 +636,8 @@ async def action_delete_proxy(query, proxy_id: str):
     proxies = config.get("proxies", {})
 
     if proxy_id not in proxies:
-        await query.edit_message_text("❌ Прокси не найден")
+        await query.answer("❌ Прокси не найден", show_alert=True)
+        await show_proxy_list(query)
         return
 
     container_name = f"mtproto-{proxy_id}"
@@ -651,8 +652,41 @@ async def action_delete_proxy(query, proxy_id: str):
         return
 
     logger.info("Прокси %s удалён", proxy_id)
-    await query.answer(f"✅ {proxy_id} удалён", show_alert=False)
-    await show_proxy_list(query)
+
+    # Показываем обновлённый список (конфиг уже изменён)
+    updated_proxies = config.get("proxies", {})
+    running = get_running_containers()
+
+    if not updated_proxies:
+        await query.edit_message_text(
+            f"✅ Прокси <code>{proxy_id}</code> удалён.\n\n📭 Список прокси пуст.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Добавить прокси", callback_data="proxy_add")],
+                [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
+            ]),
+            parse_mode="HTML",
+        )
+        return
+
+    msg_lines = [f"✅ Прокси <code>{proxy_id}</code> удалён.\n\n📋 <b>Список прокси:</b>\n"]
+    keyboard = []
+
+    for name, data in updated_proxies.items():
+        port = data.get("port", "?")
+        container_name = f"mtproto-{name}"
+        is_running = container_name in running
+        status_icon = "✅" if is_running else "❌"
+        msg_lines.append(f"{status_icon} <b>{name}</b> — порт <code>{port}</code>")
+        keyboard.extend(build_proxy_row(name, is_running))
+
+    keyboard.append([InlineKeyboardButton("➕ Добавить прокси", callback_data="proxy_add")])
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="main_menu")])
+
+    await query.edit_message_text(
+        "\n".join(msg_lines),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
+    )
 
 
 # ─── Точка входа ─────────────────────────────────────────────────────────────
