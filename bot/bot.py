@@ -25,6 +25,8 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0"))
 
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "/app/config/proxies.json")
+# Путь к конфигу на хосте (для монтирования в прокси-контейнеры)
+HOST_CONFIG_DIR = os.environ.get("HOST_CONFIG_DIR", "/root/.openclaw/workspace/mtproto-proxy/config")
 MTG_IMAGE = os.environ.get("MTG_IMAGE", "mtproto-mtg:latest")
 MTG_BINARY = os.environ.get("MTG_BINARY", "/usr/local/bin/mtg")
 
@@ -68,27 +70,25 @@ def save_config(data: dict) -> bool:
 # ─── Вспомогательные функции ─────────────────────────────────────────────────
 
 def generate_secret() -> str:
-    """Генерация MTProto-секрета через бинарник mtg, fallback — hex."""
+    """Генерация MTProto-секрета через docker run mtg, fallback — hex."""
     try:
         result = subprocess.run(
-            [MTG_BINARY, "generate-secret", "t.me"],
-            capture_output=True, text=True, timeout=5
+            ["docker", "run", "--rm", MTG_IMAGE, "mtg", "generate-secret", "t.me"],
+            capture_output=True, text=True, timeout=30
         )
         if result.returncode == 0 and result.stdout.strip():
             secret = result.stdout.strip()
-            logger.info("Секрет сгенерирован через mtg binary")
+            logger.info("Секрет сгенерирован через mtg image: %s", secret)
             return secret
-        logger.warning("mtg binary вернул код %d: %s", result.returncode, result.stderr.strip())
-    except FileNotFoundError:
-        logger.warning("MTG binary не найден по пути: %s", MTG_BINARY)
+        logger.warning("mtg generate-secret вернул код %d: %s", result.returncode, result.stderr.strip())
     except subprocess.TimeoutExpired:
-        logger.warning("Таймаут при генерации секрета через mtg")
+        logger.warning("Таймаут при генерации секрета через docker run mtg")
     except OSError as e:
-        logger.warning("Ошибка запуска mtg: %s", e)
+        logger.warning("Ошибка запуска docker run mtg: %s", e)
 
-    # Fallback: стандартный hex-секрет (32 байта = 64 символа)
-    fallback = secrets.token_hex(32)
-    logger.info("Использован fallback для генерации секрета")
+    # Fallback: FakeTLS секрет (ee + 32 hex-байта = 66 символов)
+    fallback = "ee" + secrets.token_hex(32)
+    logger.info("Использован fallback hex-секрет")
     return fallback
 
 
@@ -135,13 +135,12 @@ def start_proxy_container(proxy_id: str, port: int | str, secret: str) -> tuple[
     subprocess.run(["docker", "stop", container_name], capture_output=True)
     subprocess.run(["docker", "rm", container_name], capture_output=True)
 
-    config_dir = os.path.dirname(CONFIG_PATH)
-
+    # Монтируем путь к конфигу с хоста (не из контейнера бота)
     cmd = [
         "docker", "run", "-d",
         "--name", container_name,
         "-p", f"{port}:8443",
-        "-v", f"{config_dir}:/app/config:ro",
+        "-v", f"{HOST_CONFIG_DIR}:/app/config:ro",
         "-e", f"PROXY_ID={proxy_id}",
         "--restart", "unless-stopped",
         MTG_IMAGE,
